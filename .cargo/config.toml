@@ -1,0 +1,7 @@
+# Mirror del índice de crates.io para entornos donde crates.io está bloqueado por proxy.
+# Entornos sin restricciones pueden eliminar este archivo para usar crates.io directamente.
+[source.crates-io]
+replace-with = "ustc"
+
+[source.ustc]
+registry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"
