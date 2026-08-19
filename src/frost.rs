@@ -15,6 +15,9 @@
 //! - Claves y nonces normalizados even-y; el desafío `e` usa `xonly(R)`.
 //! - `rho_i` (binding factor) es un hash etiquetado determinista.
 //! - El agregador niega `s` cuando `R` tiene Y impar (BIP340).
+//!
+//! La decisión de mantener un motor FROST propio (en lugar de
+//! `frost-secp256k1-tr`) está documentada en `docs/decisions/0001-frost-propia.md`.
 
 use crate::error::Error;
 use crate::schnorr::verify_bip340;
