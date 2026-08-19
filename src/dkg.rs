@@ -647,6 +647,7 @@ mod tests {
         generate_participant_key()
     }
 
+    #[allow(clippy::type_complexity)]
     fn setup_two() -> (
         SecretShare,
         SecretShare,

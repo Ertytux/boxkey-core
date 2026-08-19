@@ -23,14 +23,12 @@ fn build_shares(n: u8, t: u8) -> Vec<Share> {
     }
 
     let mut shares = Vec::new();
-    for i in 0..n as usize {
+    for (sk, pk) in keys.iter() {
         let mut partials = Vec::new();
         for j in 0..n as usize {
-            let mine: &EncryptedShare = encrypted_by[j]
-                .iter()
-                .find(|e| e.recipient == keys[i].1)
-                .unwrap();
-            let part = dkg::verify_and_decrypt_share(mine, &keys[i].0).unwrap();
+            let mine: &EncryptedShare =
+                encrypted_by[j].iter().find(|e| e.recipient == *pk).unwrap();
+            let part = dkg::verify_and_decrypt_share(mine, sk).unwrap();
             dkg::verify_share(&part, &all[j]).unwrap();
             partials.push(part);
         }
