@@ -14,10 +14,12 @@ use zeroize::Zeroizing;
 
 use crate::secp256k1;
 
-/// Serializa un array `[u8; N]` a JSON como hexadecimal.
+/// Serializa un array `[u8; N]` a JSON como hexadecimal en minúsculas sin
+/// prefijo `0x` (BZ-0010 §2.5/2.6, representación canónica textual).
 ///
 /// `serde` no cubre arrays `> 32` (firma BIP340, 64 bytes): se codifican como
-/// `0x...` para que el JSON sea compacto y legible.
+/// hex para que el JSON sea compacto y legible. Al deserializar se tolera el
+/// prefijo `0x` (entrada indulgente, salida canónica).
 mod serde_hex_array {
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -25,9 +27,7 @@ mod serde_hex_array {
     where
         S: Serializer,
     {
-        let mut s = String::from("0x");
-        s.push_str(&hex::encode(bytes));
-        serializer.serialize_str(&s)
+        serializer.serialize_str(&hex::encode(bytes))
     }
 
     pub fn deserialize<'de, const N: usize, D>(deserializer: D) -> Result<[u8; N], D::Error>
@@ -43,12 +43,55 @@ mod serde_hex_array {
     }
 }
 
+/// Serializa un `Vec<u8>` a JSON como hexadecimal en minúsculas sin prefijo
+/// `0x` (BZ-0010 §2.9: los arrays binarios se representan como hex).
+///
+/// Al deserializar se tolera el prefijo `0x` (entrada indulgente, salida canónica).
+mod serde_hex_vec {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&hex::encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let trimmed = s.strip_prefix("0x").unwrap_or(&s);
+        hex::decode(trimmed).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Clave pública x-only BIP340 (32 bytes).
 ///
 /// Es la representación pública de un punto de `secp256k1` (coordenada X),
-/// usada para claves de participantes, del BoxKey y compromisos.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// usada para claves de participantes, del BoxKey y compromisos. Serializa a
+/// hex minúsculas sin prefijo (BZ-0010 §2.5).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PublicKey(pub [u8; 32]);
+
+impl Serialize for PublicKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serde_hex_array::serialize(&self.0, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PublicKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(PublicKey(serde_hex_array::deserialize(deserializer)?))
+    }
+}
 
 /// Clave privada escalar (32 bytes).
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -83,19 +126,21 @@ pub struct SecretShare {
 /// En contexto DKG es un punto comprimido SEC1 (33 bytes) `a_j·G`
 /// (commitment de Feldman). En contexto FROST agrega además el identificador
 /// del firmante y los nonces `D || E`:
-/// `identifier (4) || D || E` (70 bytes).
+/// `identifier (4) || D || E` (70 bytes). Se serializa como hex sin prefijo.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Commitment(pub Vec<u8>);
+pub struct Commitment(#[serde(with = "serde_hex_vec")] pub Vec<u8>);
 
 /// Share cifrada end-to-end entre un emisor y un destinatario.
 ///
 /// `ciphertext` incluye la clave efímera del emisor, el nonce y el payload
 /// cifrado (AEAD). El coordinador (BS) nunca puede leer el contenido.
+/// El campo `ciphertext` se serializa como hex sin prefijo.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct EncryptedShare {
     /// Clave pública x-only del destinatario.
     pub recipient: PublicKey,
     /// `ephemeral_pubkey(33) || nonce(12) || tag(16) || ciphertext`.
+    #[serde(with = "serde_hex_vec")]
     pub ciphertext: Vec<u8>,
 }
 
@@ -105,8 +150,10 @@ pub struct EncryptedShare {
 /// - umbral (u8), nº de firmantes (u32 BE), clave pública del grupo (32),
 /// - por firmante: identificador (u32 BE) || D (33) || E (33) || Y_i (33), y
 /// - `z` del firmante (u32 BE identificador || 32 bytes escalar).
+///
+/// Se serializa como hex sin prefijo.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
-pub struct PartialSignature(pub Vec<u8>);
+pub struct PartialSignature(#[serde(with = "serde_hex_vec")] pub Vec<u8>);
 
 /// Firma Schnorr BIP340 agregada `(R.x || s)` (64 bytes).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -266,5 +313,50 @@ impl SchnorrSignature {
     /// Bytes `(R.x || s)` de la firma.
     pub fn as_bytes(&self) -> &[u8; 64] {
         &self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_serde_no_usa_prefijo_0x() {
+        let pk = PublicKey([0xab; 32]);
+        let sig = SchnorrSignature([0xcd; 64]);
+
+        let pk_json = serde_json::to_string(&pk).expect("PublicKey serializable");
+        let sig_json = serde_json::to_string(&sig).expect("SchnorrSignature serializable");
+
+        assert!(
+            !pk_json.contains("0x"),
+            "PublicKey no debe usar prefijo 0x: {pk_json}"
+        );
+        assert!(
+            !sig_json.contains("0x"),
+            "SchnorrSignature no debe usar prefijo 0x: {sig_json}"
+        );
+
+        assert_eq!(pk_json.len(), 64 + 2, "32 bytes en 64 chars hex");
+        assert_eq!(sig_json.len(), 128 + 2, "64 bytes en 128 chars hex");
+
+        let pk_round: PublicKey = serde_json::from_str(&pk_json).expect("deserializa");
+        let sig_round: SchnorrSignature = serde_json::from_str(&sig_json).expect("deserializa");
+        assert_eq!(pk_round, pk);
+        assert_eq!(sig_round, sig);
+    }
+
+    #[test]
+    fn hex_deseriliza_tolerando_prefijo_0x() {
+        let sig: SchnorrSignature =
+            serde_json::from_str(&format!("\"0x{}\"", hex::encode([0x11; 64])))
+                .expect("acepta 0x al parsear");
+        assert_eq!(sig.0, [0x11; 64]);
+    }
+
+    #[test]
+    fn hex_deseriliza_rechaza_longitud_incorrecta() {
+        let err = serde_json::from_str::<PublicKey>("\"abcd\"").expect_err("longitud inválida");
+        assert!(err.to_string().contains("32 bytes"));
     }
 }
