@@ -356,7 +356,7 @@ struct ParsedPartial {
 /// Parsea una firma parcial validando estructura completa.
 fn parse_partial(sig: &PartialSignature) -> Result<ParsedPartial, Error> {
     let b = &sig.0;
-    if b.len() < 38 + BLOCK_LEN + Z_SUFFIX_LEN {
+    if b.len() < 37 + BLOCK_LEN + Z_SUFFIX_LEN {
         return Err(Error::InvalidSignature(
             "firma parcial demasiado corta".into(),
         ));
@@ -625,6 +625,26 @@ mod tests {
                 sign_partial(round, s, &hidden).unwrap()
             })
             .collect()
+    }
+
+    #[test]
+    fn one_of_one_signs_and_verifies() {
+        let (shares, _keys) = dkg::run_dkg(1, 1);
+        let msg = [0x42u8; 32];
+        let signer = &shares[0];
+        let (hidden, comm) = generate_nonces(signer, &msg).unwrap();
+        let round = SigningRound::new(
+            msg,
+            signer.group_public_key(),
+            &[(signer.identifier(), comm)],
+            &[(signer.identifier(), signer.full_public_key_point())],
+        )
+        .unwrap();
+        let sig = sign_partial(&round, signer, &hidden).unwrap();
+        verify_partial(&sig, &signer.partial_public_key(), &msg).expect("1-de-1 válida");
+
+        let agg = aggregate_signatures(&[sig], &round.group_public_key, &msg).unwrap();
+        verify_schnorr(&agg, &round.group_public_key, &msg).expect("firma final válida");
     }
 
     #[test]
