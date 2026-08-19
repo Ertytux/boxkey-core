@@ -85,6 +85,15 @@ pub(crate) fn schnorr_sign(secret: &Fs, msg: &[u8; 32]) -> [u8; 64] {
     }
 }
 
+/// Firma Schnorr BIP340 determinística de un escalar secreto en bytes.
+///
+/// Wrapper sobre [`schnorr_sign`] para las APIs que operan con el material
+/// secreto como `[u8; 32]` (p. ej. la firma de envelopes en `serialize`).
+pub(crate) fn schnorr_sign_bytes(secret: &[u8; 32], msg: &[u8; 32]) -> Result<[u8; 64], Error> {
+    let s = scalar_from_canonical(secret)?;
+    Ok(schnorr_sign(&s, msg))
+}
+
 /// Verifica una firma Schnorr BIP340 frente a una clave pública x-only.
 ///
 /// Implementa el algoritmo `Verify(pk, m, sig)` de BIP340 paso a paso.
