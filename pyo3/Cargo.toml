@@ -1,0 +1,19 @@
+[package]
+name = "boxkey-py"
+version = "1.0.0"
+edition = "2021"
+description = "Bindings Python de boxkey-core (PyO3): clase BoxKey conforme a contratos.md §2."
+license = "MIT"
+
+[lib]
+name = "boxkey"
+crate-type = ["cdylib"]
+
+[dependencies]
+boxkey-core = { path = ".." }
+pyo3 = { version = "0.22", features = ["extension-module"] }
+hex = "0.4"
+
+[profile.release]
+lto = true
+codegen-units = 1
