@@ -1,16 +1,18 @@
 {
-  "meta": {
-    "name": "DKG 2-of-3",
-    "description": "Vector de test para DKG 2-of-3. Generado con seeds deterministas.",
-    "generated_by": "boxkey-core v1.0.0",
-    "generated_at": "2026-08-20"
-  },
-  "params": {
-    "n": 3,
-    "t": 2,
-    "curve": "secp256k1",
-    "crypto_suite": "secp256k1-bip340-frost"
-  },
-  "participants": [],
-  "group_public_key": ""
+  "aggregate_signature": "76cf2a364f802daf29dcc38c8cd53a0d6591b56d89fbb684834b48607933887d408ba3b1b39b25bcfbceb4ada51ae14629037194fb6b81dc17fc4632663a9f9d",
+  "expected_verification": true,
+  "group_public_key": "8c92086d85bd763d901144d0a86cec1c5639b24e2df543cd8b2e5e22cf09bac1",
+  "message": "426f784b6579205030205465737420566563746f72",
+  "participants": 3,
+  "participants_used": [
+    1,
+    2
+  ],
+  "signature_shares": [
+    "0000000102ed6ffd5cd8454d17213c7cdad875c4dbca53023c8fc8724533db1187288641080265bdb64a18bca4fa3d82b1a8ec9672bcff35337eb313ded445c8ab5f62f259f7022c708ebd6f73db30f2de417f18f455c28db3d9af19190663e8d7ec760353d2a3196b3f199a735d382f13e5e08d589cf702731975ed2a227549972841efda4e07",
+    "0000000202116972e6806dd0a88898fa8386d37c2a37b9839c353cc4eb43c14bdee720e1d902276d279f069adac84e5548099d976b03d8982ddc235886cf5ebcffd9c2d7595202fe777cc7f19723172fa2d0678a2a27da19e3b5e4baf1fca5e32676338616cab3272064981927c884ccbacecd17c2444f2690581f0e415f66ce651df076605196"
+  ],
+  "signing_digest": "29993a17cff2613c127866f224803e0811cb6c9b7825c0668fe9115f2d5be10f",
+  "suite": "secp256k1-bip340-frost-v1",
+  "threshold": 2
 }

@@ -34,7 +34,11 @@ fn point_to_verifying_share(
 fn xonly_to_verifying_key(
     xonly: &[u8; 32],
 ) -> Result<frost_core::VerifyingKey<frost::Secp256K1Sha256TR>, Error> {
-    frost_core::VerifyingKey::deserialize(&xonly[..])
+    // BIP340 x-only → SEC1 comprimido (prefijo 0x02 = Y par).
+    let mut compressed = [0u8; 33];
+    compressed[0] = 0x02;
+    compressed[1..33].copy_from_slice(xonly);
+    frost_core::VerifyingKey::deserialize(&compressed[..])
         .map_err(|e| Error::InvalidPublicKey(format!("clave inválida: {e}")))
 }
 
@@ -127,9 +131,21 @@ pub fn sign_partial(
     let sig_share = frost_core::round2::sign(&signing_package, &nonces, &kp)
         .map_err(|e| Error::InvalidSignature(format!("firma parcial falló: {e}")))?;
 
-    let mut out = Vec::with_capacity(4 + 32);
+    let y_point = crate::secp256k1::point_to_bytes(&crate::secp256k1::point_mul_base(
+        &scalar_from_canonical_or_zero(&share.value)
+            .map_err(|_| Error::InvalidSecretKey("share inválida".into()))?,
+    ));
+
+    let own_comm = commitments.iter().find(|c| {
+        c.0.len() >= 4 && u32::from_be_bytes(c.0[..4].try_into().unwrap()) == id
+    }).ok_or_else(|| Error::InvalidSignature("propio commitment no encontrado".into()))?;
+
+    let mut out = Vec::with_capacity(4 + 33 + 33 + 33 + 32);
     out.extend_from_slice(&id.to_be_bytes());
-    out.extend_from_slice(&sig_share.serialize());
+    out.extend_from_slice(&own_comm.0[4..37]);   // D (33)
+    out.extend_from_slice(&own_comm.0[37..70]);  // E (33)
+    out.extend_from_slice(&y_point);              // Y (33)
+    out.extend_from_slice(&sig_share.serialize()); // z (32)
     Ok(PartialSignature(out))
 }
 
@@ -137,7 +153,6 @@ pub fn aggregate_signatures(
     sigs: &[PartialSignature],
     group_public_key: &PublicKey,
     message_hash: &[u8; 32],
-    signing_commitments: &[Commitment],
 ) -> Result<SchnorrSignature, Error> {
     if sigs.is_empty() {
         return Err(Error::InvalidSignature("sin firmas parciales".into()));
@@ -145,33 +160,46 @@ pub fn aggregate_signatures(
 
     let group_vk = xonly_to_verifying_key(&group_public_key.0)?;
 
-    let mut sig_shares = BTreeMap::new();
-    let mut comm_map = BTreeMap::new();
-    for s in sigs {
-        if s.0.len() != 36 {
-            return Err(Error::InvalidSignature("firma parcial inválida".into()));
-        }
-        let id = u32::from_be_bytes(s.0[..4].try_into().unwrap());
-        let frost_id = bc_id_to_frost(id)?;
-        let sig_share = SignatureShare::deserialize(&s.0[4..36])
-            .map_err(|e| Error::InvalidSignature(format!("sig share inválida: {e}")))?;
-        sig_shares.insert(frost_id, sig_share);
+    if sigs.iter().any(|s| s.0.len() != 4 + 33 + 33 + 33 + 32) {
+        return Err(Error::InvalidSignature(
+            "firma parcial inválida: debe ser id(4)||D(33)||E(33)||Y(33)||z(32)".into(),
+        ));
     }
 
-    for comm in signing_commitments {
-        if comm.0.len() < 4 {
-            return Err(Error::InvalidSignature("commitment demasiado corto".into()));
-        }
-        let cid = u32::from_be_bytes(comm.0[..4].try_into().unwrap());
-        let frost_cid = bc_id_to_frost(cid)?;
-        let scomm = bc_commitment_to_frost(comm)?;
-        comm_map.insert(frost_cid, scomm);
+    let mut sig_shares = BTreeMap::new();
+    let mut verifying_shares = BTreeMap::new();
+    let mut comm_map = BTreeMap::new();
+
+    for s in sigs {
+        let id = u32::from_be_bytes(s.0[..4].try_into().unwrap());
+        let frost_id = bc_id_to_frost(id)?;
+
+        // D(33) y E(33)
+        let d_bytes: &[u8; 33] = &s.0[4..37].try_into().expect("D slice");
+        let e_bytes: &[u8; 33] = &s.0[37..70].try_into().expect("E slice");
+
+        let hiding = frost_core::round1::NonceCommitment::deserialize(&d_bytes[..])
+            .map_err(|e| Error::InvalidSignature(format!("D inválido: {e}")))?;
+        let binding = frost_core::round1::NonceCommitment::deserialize(&e_bytes[..])
+            .map_err(|e| Error::InvalidSignature(format!("E inválido: {e}")))?;
+        let scomm = SigningCommitments::new(hiding, binding);
+        comm_map.insert(frost_id, scomm);
+
+        // Y(33)
+        let y_point: &[u8; 33] = &s.0[70..103].try_into().expect("Y slice");
+        let vs = point_to_verifying_share(y_point)?;
+        verifying_shares.insert(frost_id, vs);
+
+        // z(32)
+        let sig_share = SignatureShare::deserialize(&s.0[103..135])
+            .map_err(|e| Error::InvalidSignature(format!("sig share inválida: {e}")))?;
+        sig_shares.insert(frost_id, sig_share);
     }
 
     let signing_package = frost_core::SigningPackage::new(comm_map, message_hash);
 
     let pubkey_package = frost_core::keys::PublicKeyPackage::new(
-        BTreeMap::new(),
+        verifying_shares,
         group_vk,
         Some(sigs.len() as u16),
     );

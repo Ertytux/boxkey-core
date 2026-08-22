@@ -157,7 +157,7 @@ pub fn combine_redistributed_shares(
 mod tests {
     use super::*;
     use crate::dkg;
-    use crate::frost;
+    use crate::frost_adapter;
     use crate::secp256k1::{point_x_bytes, scalar_random, scalar_to_bytes};
     use rand::rngs::OsRng;
 
@@ -182,7 +182,7 @@ mod tests {
         let new_ids: Vec<u32> = (1u32..=4).collect();
         let new_threshold = 2u8;
 
-        // Cada contribuyente entrega a cada nuevo participante.
+        // Cada contribuyente entrega a cada nuevo participant.
         let mut deliveries_per_contributor = Vec::new();
         for c in contributors.iter().take(2) {
             let mut vec = Vec::new();
@@ -222,29 +222,26 @@ mod tests {
             new_shares.push(combined);
         }
 
-        // Dos de los cuatro nuevos firmantes firman y la FROST verifica.
+        // Dos de los cuatro nuevos firmantes firman y la FROST (frost-core) verifica.
         let msg = [0x77u8; 32];
         let signers = &new_shares[..2];
-        let mut commitments = Vec::new();
-        let mut full_public_keys = Vec::new();
+        let mut rng = OsRng;
         let mut hidden = Vec::new();
+        let mut commitments = Vec::new();
         for s in signers {
-            let (h, comm) = frost::generate_nonces(s, &msg).unwrap();
-            commitments.push((s.identifier(), comm.clone()));
-            let full_pk = s.full_public_key_point();
-            full_public_keys.push((s.identifier(), full_pk));
+            let (h, comm) = frost_adapter::generate_nonces(s, &mut rng).unwrap();
             hidden.push(h);
+            commitments.push(comm);
         }
-        let round =
-            frost::SigningRound::new(msg, group_key, &commitments, &full_public_keys).unwrap();
         let mut sigs = Vec::new();
         for (i, s) in signers.iter().enumerate() {
-            sigs.push(frost::sign_partial(&round, s, &hidden[i]).unwrap());
+            sigs.push(
+                frost_adapter::sign_partial(s, &msg, &commitments, &hidden[i]).unwrap(),
+            );
         }
-        for (i, s) in signers.iter().enumerate() {
-            frost::verify_partial(&sigs[i], &s.partial_public_key(), &msg).unwrap();
-        }
-        let agg = frost::aggregate_signatures(&sigs, &group_key, &msg).unwrap();
-        frost::verify_schnorr(&agg, &group_key, &msg).expect("firma del grupo redistribuido");
+        let agg = frost_adapter::aggregate_signatures(&sigs, &group_key, &msg)
+            .unwrap();
+        frost_adapter::verify_schnorr(&agg, &group_key, &msg)
+            .expect("firma del grupo redistribuido");
     }
 }

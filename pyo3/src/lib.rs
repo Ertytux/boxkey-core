@@ -277,7 +277,8 @@ impl PyBoxKey {
 
     #[staticmethod]
     fn generate_nonces(share: &PyShare) -> (Vec<u8>, Vec<u8>) {
-        <BoxKeyCoreImpl as BoxKeyCore>::generate_nonces(&share.0)
+        let (h, c) = <BoxKeyCoreImpl as BoxKeyCore>::generate_nonces(&share.0);
+        (h, c.0)
     }
 
     #[staticmethod]
@@ -291,20 +292,6 @@ impl PyBoxKey {
         <BoxKeyCoreImpl as BoxKeyCore>::sign_partial(&share.0, &hash, &c)
             .map(PyPartialSignature)
             .map_err(to_pyerr)
-    }
-
-    #[staticmethod]
-    fn verify_partial(
-        sig: &PyPartialSignature,
-        participant_pubkey: &PyPublicKey,
-        message_hash: Vec<u8>,
-    ) -> PyResult<bool> {
-        let hash = hash32(message_hash)?;
-        Ok(<BoxKeyCoreImpl as BoxKeyCore>::verify_partial(
-            &sig.0,
-            &participant_pubkey.0,
-            &hash,
-        ))
     }
 
     #[staticmethod]

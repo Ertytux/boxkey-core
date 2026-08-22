@@ -1,8 +1,9 @@
-//! Bench de firma FROST (ver plan Fase 1). Mide coste por contribución parcial
-//! y por verificación, sobre un DKG 2-de-3 montado con la API pública.
+//! Bench de firma FROST via frost-core adapter (frost-secp256k1-tr).
+//! Mide coste por contribución parcial y por agregación,
+//! sobre un DKG 2-de-3 montado con la API pública.
 
 use boxkey_core::dkg;
-use boxkey_core::frost;
+use boxkey_core::frost_adapter;
 use boxkey_core::{EncryptedShare, Share};
 use criterion::{criterion_group, criterion_main, Criterion};
 
@@ -43,29 +44,31 @@ fn bench_partial_sign(c: &mut Criterion) {
     let msg = [0x9u8; 32];
     let signers = &shares[..2];
 
-    let mut commitments = Vec::new();
-    let mut full_public_keys = Vec::new();
+    let mut rng = rand::rngs::OsRng;
     let mut hidden = Vec::new();
+    let mut commitments = Vec::new();
     for s in signers {
-        let (h, comm) = frost::generate_nonces(s, &msg).unwrap();
-        commitments.push((s.identifier(), comm));
-        full_public_keys.push((s.identifier(), s.full_public_key_point()));
+        let (h, comm) = frost_adapter::generate_nonces(s, &mut rng).unwrap();
         hidden.push(h);
+        commitments.push(comm);
     }
-    let round = frost::SigningRound::new(msg, group, &commitments, &full_public_keys).unwrap();
 
-    c.bench_function("frost_partial_sign", |b| {
+    c.bench_function("frost_adapter_partial_sign", |b| {
         b.iter(|| {
-            let sig = frost::sign_partial(&round, &signers[0], &hidden[0]).unwrap();
+            let sig = frost_adapter::sign_partial(&signers[0], &msg, &commitments, &hidden[0])
+                .unwrap();
             std::hint::black_box(sig);
         })
     });
 
-    let sig = frost::sign_partial(&round, &signers[0], &hidden[0]).unwrap();
-    c.bench_function("frost_verify_partial", |b| {
+    let sig = frost_adapter::sign_partial(&signers[0], &msg, &commitments, &hidden[0]).unwrap();
+    let all_sigs = vec![sig];
+    c.bench_function("frost_adapter_aggregate", |b| {
         b.iter(|| {
-            frost::verify_partial(&sig, &signers[0].partial_public_key(), &msg).unwrap();
-        });
+            let agg =
+                frost_adapter::aggregate_signatures(&all_sigs, &group, &msg).unwrap();
+            std::hint::black_box(agg);
+        })
     });
 }
 
