@@ -1,0 +1,16 @@
+{
+  "meta": {
+    "name": "DKG 2-of-3",
+    "description": "Vector de test para DKG 2-of-3. Generado con seeds deterministas.",
+    "generated_by": "boxkey-core v1.0.0",
+    "generated_at": "2026-08-20"
+  },
+  "params": {
+    "n": 3,
+    "t": 2,
+    "curve": "secp256k1",
+    "crypto_suite": "secp256k1-bip340-frost"
+  },
+  "participants": [],
+  "group_public_key": ""
+}
