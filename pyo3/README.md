@@ -1,12 +1,9 @@
 # boxkey-py — Bindings Python de boxkey-core (PyO3)
 
 Bindings Python de `boxkey-core` mediante PyO3. Exponen la clase `BoxKey`
-(1:1 con el trait `BoxKeyCore` de `contratos.md §2`) y funciones de módulo
-para DKG y generación de claves.
+(1:1 con el trait `BoxKeyCore`) y funciones de módulo para DKG.
 
-## Build y regeneración (maturin)
-
-Requisitos: `maturin` instalado y un entorno Python activo.
+## Build (maturin)
 
 ```bash
 python -m pip install maturin
@@ -14,42 +11,46 @@ maturin develop           # compila e instala en el entorno actual
 maturin build --release   # genera un wheel en target/wheels/
 ```
 
-Para regenerar tras cambios en `boxkey-core`, basta re-ejecutar el mismo
-comando (maturin detecta la dependencia por ruta).
-
-## Ejemplo (Fase1.0 §5.8)
+## Ejemplo
 
 ```python
-from boxkey import BoxKey
+from boxkey import BoxKey, run_dkg
 
+# DKG 2-de-3
+result = run_dkg(3, 2)
+share0 = result.shares[0]
+share1 = result.shares[1]
+group_pk = share0.group_public_key
+msg = b'\x42' * 32
+
+# Cada firmante genera nonces
 bk = BoxKey()
-secret = bk.generate_secret()
-commitments = bk.compute_commitments(secret, threshold=2, total_participants=3)
-```
+handle0, comm0 = bk.generate_nonces(share0)
+handle1, comm1 = bk.generate_nonces(share1)
 
-Flujo completo 1-de-1 (firma Schnorr BIP340):
+# El coordinador construye la sesión
+vk0 = share0.full_public_key_point
+vk1 = share1.full_public_key_point
+session = bk.SigningSession.new(
+    msg, group_pk, 2,
+    [comm0, comm1],
+    [(share0.identifier, vk0), (share1.identifier, vk1)],
+)
 
-```python
-from boxkey import BoxKey
+# Firmas parciales (cada handle se consume al firmar)
+sig0 = bk.sign_partial(share0, session, handle0)
+sig1 = bk.sign_partial(share1, session, handle1)
 
-bk = BoxKey()
-r = bk.run_dkg(1, 1)                     # o boxkey.run_dkg(1, 1)
-share = r.shares[0]
-group = share.group_public_key
-msg = bytes(32)
+# Agregación → Schnorr BIP340
+agg = bk.aggregate_signatures([sig0, sig1], session)
 
-hidden, comm = bk.generate_nonces(share)
-sig = bk.sign_partial(share, msg, [boxkey.Commitment.from_bytes(comm)])
-assert bk.verify_partial(sig, share.partial_public_key, msg)
-agg = bk.aggregate_signatures([sig], group, msg)
-assert bk.verify_schnorr(agg, group, msg)
+# Verificación independiente
+assert bk.verify_schnorr(agg, group_pk, msg)
 ```
 
 ## Notas
 
-- `BoxKey` y el resto de pyclasses replican las desviaciones del trait
-  `BoxKeyCore` (ver `src/api.rs` en `boxkey-core`): `verify_partial` del trait
-  es fiable solo en rounds de un firmante o para el primer bloque del round;
-  la firma multi-firmante se hace con la API avanzada de Rust.
+- `NonceHandle` encapsula el secreto: no expone `to_bytes()`.
+- `NonceHandle` se consume al firmar; reutilizar un handle consumido produce error.
 - `SecretKey.__repr__` nunca imprime el secreto (`[REDACTED]`).
 - Los tipos se serializan como hex sin prefijo `0x` (BZ-0010 §2).

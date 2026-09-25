@@ -213,6 +213,41 @@ fn nonce_handle_consumido_no_reutilizable() {
     assert!(result.is_err(), "handle consumido debe rechazar segunda firma");
 }
 
+/// Wrong share ↔ nonce handle: NonceHandle(A) con Share(B) debe rechazar.
+#[test]
+fn wrong_share_nonce_handle_is_rejected() {
+    let (shares, _) = dkg::run_dkg(2, 2);
+    let group = shares[0].group_public_key();
+    let msg = [0x42u8; 32];
+
+    let mut rng = rand::rngs::OsRng;
+
+    // Generar nonces para ambos firmantes
+    let (mut h1, c1) = frost_adapter::generate_nonces(&shares[0], &mut rng).unwrap();
+    let (mut h2, c2) = frost_adapter::generate_nonces(&shares[1], &mut rng).unwrap();
+
+    let vk1 = shares[0].full_public_key_point();
+    let vk2 = shares[1].full_public_key_point();
+
+    let session = SigningSession::new(msg, group, 2,
+        vec![c1, c2],
+        vec![(shares[0].identifier(), vk1), (shares[1].identifier(), vk2)],
+    ).expect("sesión");
+
+    // Intentar firmar con share[0] pero NonceHandle[1] → debe rechazar
+    let result = frost_adapter::sign_partial(&shares[0], &session, &mut h2);
+    assert!(result.is_err(), "share A + handle B debe rechazar");
+
+    // El handle B no debe quedar consumido tras el rechazo
+    assert!(!h2.is_consumed(), "handle B no debe consumirse tras error de asociación");
+
+    // La combinación correcta sí funciona
+    let sig1 = frost_adapter::sign_partial(&shares[0], &session, &mut h1).unwrap();
+    let sig2 = frost_adapter::sign_partial(&shares[1], &session, &mut h2).unwrap();
+    let agg = frost_adapter::aggregate_signatures(&[sig1, sig2], &session).unwrap();
+    assert!(frost_adapter::verify_schnorr(&agg, &group, &msg).is_ok());
+}
+
 /// Missing signer: firmante no incluido en la sesión.
 #[test]
 fn missing_signer_rechazado() {

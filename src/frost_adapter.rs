@@ -117,6 +117,14 @@ pub fn sign_partial(
     session: &SigningSession,
     handle: &mut NonceHandle,
 ) -> Result<PartialSignature, Error> {
+    if handle.identifier() != share.identifier() {
+        return Err(Error::InvalidSignature(format!(
+            "NonceHandle pertenece al firmante {} pero el share es del firmante {}",
+            handle.identifier(),
+            share.identifier(),
+        )));
+    }
+
     let kp = bc_share_to_key_package(share)?;
     let id = share.identifier();
 

@@ -8,52 +8,54 @@ Biblioteca criptográfica central del protocolo [BoxKey](https://github.com/Erty
 |---|---|
 | `api` | Capa conforme a `contratos.md §2` (trait `BoxKeyCore`) — interfaz pública primaria |
 | `secp256k1` | Aritmética de curva sobre `k256` (RustCrypto): escalares, puntos, ECDH, tagged hash BIP340 |
-| `schnorr` | Firma y verificación BIP340 (múltiples motores) |
+| `schnorr` | Firma y verificación BIP340 (`k256::schnorr`) |
 | `dkg` | Generación Distribuida de Claves (Feldman VSS + PoK sobre Schnorr + cifrado ECDH) |
-| `frost` | Firma distribuida FROST (RFC 9591) adaptada a BIP340 |
+| `frost_adapter` | Adaptador a `frost-core` 3.0 + `frost-secp256k1-tr` (RFC 9591) |
 | `reshare` | Redistribución de un BoxKey a un nuevo conjunto de participantes |
 | `serialize` | Envelopes BC-scoped versionados (BZ-0012/0013) en JSON canónico |
-| `types` | Tipos públicos: `PublicKey`, `Share`, `Commitment`, `PartialSignature`, `SchnorrSignature`... |
+| `types` | Tipos públicos: `PublicKey`, `Share`, `Commitment`, `NonceHandle`, `SigningSession`, `PartialSignature`, `SchnorrSignature`... |
 | `error` | Errores unificados del protocolo con códigos BZ-0011 (`Error::code()`) |
 
 La interfaz pública primaria es el trait `api::BoxKeyCore` (firmas 1:1 con
-`contratos.md §2`); el motor avanzado (DKG/FROST/reshare) queda expuesto para
-integraciones con control fino. La decisión de mantener FROST propio está en
-`docs/decisions/0001-frost-propia.md`.
+`contratos.md §2`). El motor FROST delega en `frost-core` 3.0 + `frost-secp256k1-tr`;
+el DKG (Gennaro/Feldman VSS) y el cifrado ECDH se mantienen propios en `dkg.rs`.
 
-## Uso — capa conforme (`BoxKeyCore`)
-
-```rust
-use boxkey_core::{BoxKeyCore, BoxKeyCoreImpl};
-
-// DKG 2-de-3 vía el trait
-let secret = <BoxKeyCoreImpl as BoxKeyCore>::generate_secret();
-let commitments = <BoxKeyCoreImpl as BoxKeyCore>::compute_commitments(&secret, 2, 3);
-// ... verificar_commitments, generate_shares, verify_and_decrypt_share,
-//     derive_public_key, sign_partial, aggregate_signatures, verify_schnorr
-```
-
-## Uso — API avanzada
+## Uso
 
 ```rust
 use boxkey_core::dkg;
-use boxkey_core::frost;
+use boxkey_core::frost_adapter;
+use boxkey_core::{NonceHandle, SigningSession, PublicKey, SchnorrSignature};
 
 // DKG 2-de-3
 let (shares, _) = dkg::run_dkg(3, 2);
-let group = shares[0].group_public_key();
+let group_key = shares[0].group_public_key();
 
-// FROST
-let msg = [0x42u8; 32];
+// Cada firmante genera nonces (NonceHandle + Commitment)
+let mut rng = rand::rngs::OsRng;
 let signers = &shares[..2];
-let (hidden, comm) = frost::generate_nonces(&signers[0], &msg).unwrap();
-let round = frost::SigningRound::new(/* ... */).unwrap();
-let sig = frost::sign_partial(&round, &signers[0], &hidden).unwrap();
-frost::verify_partial(&sig, &signers[0].partial_public_key(), &msg).unwrap();
+let (mut h1, c1) = frost_adapter::generate_nonces(&signers[0], &mut rng).unwrap();
+let (mut h2, c2) = frost_adapter::generate_nonces(&signers[1], &mut rng).unwrap();
 
-// Agregar
-let agg = frost::aggregate_signatures(&[sig], &group, &msg).unwrap();
-frost::verify_schnorr(&agg, &group, &msg).unwrap();
+// El coordinador construye la sesión
+let msg = [0x42u8; 32];
+let vk1 = signers[0].full_public_key_point();
+let vk2 = signers[1].full_public_key_point();
+let session = SigningSession::new(
+    msg, group_key, 2,
+    vec![c1, c2],
+    vec![(signers[0].identifier(), vk1), (signers[1].identifier(), vk2)],
+).expect("sesión");
+
+// Firmas parciales (consumen el NonceHandle)
+let sig1 = frost_adapter::sign_partial(&signers[0], &session, &mut h1).unwrap();
+let sig2 = frost_adapter::sign_partial(&signers[1], &session, &mut h2).unwrap();
+
+// Agregación → Schnorr BIP340
+let agg = frost_adapter::aggregate_signatures(&[sig1, sig2], &session).unwrap();
+
+// Verificación independiente vía k256::schnorr
+frost_adapter::verify_schnorr(&agg, &group_key, &msg).unwrap();
 ```
 
 ## Demo
@@ -74,12 +76,12 @@ maturin develop        # instala el módulo `boxkey` en el entorno actual
 # o: maturin build --release
 ```
 
-Ver `pyo3/README.md` para el ejemplo completo (Fase1.0 §5.8).
+Ver `pyo3/README.md` para el ejemplo completo.
 
 ## Pruebas
 
 ```bash
-cargo test
+cargo test --locked
 ```
 
 ## Benchmarks
@@ -90,8 +92,8 @@ cargo bench            # firma FROST y DKG (dkg_bench + signing_bench)
 
 ## Dependencias
 
-- `k256` 0.13 (RustCrypto) — motor aritmético de `secp256k1`
-- `secp256k1` 0.31 — oráculo de verificación externa (BIP340)
+- `frost-core` 3.0 + `frost-secp256k1-tr` 3.0 — FROST RFC 9591
+- `k256` 0.13 (RustCrypto) — motor aritmético de `secp256k1` + BIP340
 - `chacha20poly1305` 0.10 — cifrado AEAD para transporte de shares
 - `sha2` 0.10, `zeroize`, `serde`, `serde_json`, `thiserror`, `hex`
 

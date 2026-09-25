@@ -1,25 +1,3 @@
-//! Bindings Python de `boxkey-core` (PyO3).
-//!
-//! Expone la clase `BoxKey` (1:1 con el trait `BoxKeyCore` de `contratos.md §2`)
-//! y funciones de módulo para DKG y generación de claves. Compila con maturin:
-//!
-//! ```text
-//! maturin develop   # entorno actual
-//! maturin build --release
-//! ```
-//!
-//! Ejemplo:
-//! ```python
-//! from boxkey import BoxKey
-//! bk = BoxKey()
-//! secret = bk.generate_secret()
-//! commitments = bk.compute_commitments(secret, threshold=2, total_participants=3)
-//! ```
-
-// pyo3 0.22 genera wrappers que clippy marca como `useless_conversion` en los
-// retornos `Result<Self, PyErr>` de `#[pymethods]` (falso positivo conocido).
-#![allow(clippy::useless_conversion)]
-
 use boxkey_core::api::{BoxKeyCore, BoxKeyCoreImpl};
 use boxkey_core::error::Error;
 use pyo3::exceptions::PyValueError;
@@ -35,16 +13,22 @@ fn hash32(bytes: Vec<u8>) -> Result<[u8; 32], PyErr> {
         .map_err(|_| PyValueError::new_err("message_hash debe ser de 32 bytes"))
 }
 
-// ---------------------------------------------------------------------------
-// Pyclasses wrapper sobre los tipos del core (Clone + Send, nunca panican).
-// ---------------------------------------------------------------------------
+fn arr32(bytes: Vec<u8>) -> Result<[u8; 32], PyErr> {
+    bytes
+        .try_into()
+        .map_err(|_| PyValueError::new_err("debe ser de 32 bytes"))
+}
 
-/// Polinomio local de un participante durante el DKG.
+fn arr33(bytes: Vec<u8>) -> Result<[u8; 33], PyErr> {
+    bytes
+        .try_into()
+        .map_err(|_| PyValueError::new_err("debe ser de 33 bytes"))
+}
+
 #[pyclass(name = "SecretShare")]
 #[derive(Clone)]
 pub struct PySecretShare(pub boxkey_core::SecretShare);
 
-/// Compromiso criptográfico (Feldman VSS / FROST).
 #[pyclass(name = "Commitment")]
 #[derive(Clone)]
 pub struct PyCommitment(pub boxkey_core::Commitment);
@@ -61,7 +45,6 @@ impl PyCommitment {
     }
 }
 
-/// Share cifrada end-to-end entre emisor y destinatario.
 #[pyclass(name = "EncryptedShare")]
 #[derive(Clone)]
 pub struct PyEncryptedShare(pub boxkey_core::EncryptedShare);
@@ -79,7 +62,6 @@ impl PyEncryptedShare {
     }
 }
 
-/// Share secreta (fracción de clave) de un participante.
 #[pyclass(name = "Share")]
 #[derive(Clone)]
 pub struct PyShare(pub boxkey_core::Share);
@@ -112,7 +94,6 @@ impl PyShare {
     }
 }
 
-/// Clave pública x-only (32 bytes).
 #[pyclass(name = "PublicKey")]
 #[derive(Clone)]
 pub struct PyPublicKey(pub boxkey_core::PublicKey);
@@ -125,9 +106,7 @@ impl PyPublicKey {
 
     #[staticmethod]
     fn from_bytes(bytes: Vec<u8>) -> Result<Self, PyErr> {
-        let b: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| PyValueError::new_err("PublicKey debe ser de 32 bytes"))?;
+        let b = arr32(bytes)?;
         Ok(Self(boxkey_core::PublicKey::from_bytes(b)))
     }
 
@@ -136,7 +115,6 @@ impl PyPublicKey {
     }
 }
 
-/// Clave secreta local (32 bytes, nunca se imprime).
 #[pyclass(name = "SecretKey")]
 #[derive(Clone)]
 pub struct PySecretKey(pub boxkey_core::SecretKey);
@@ -149,9 +127,7 @@ impl PySecretKey {
 
     #[staticmethod]
     fn from_bytes(bytes: Vec<u8>) -> Result<Self, PyErr> {
-        let b: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| PyValueError::new_err("SecretKey debe ser de 32 bytes"))?;
+        let b = arr32(bytes)?;
         Ok(Self(boxkey_core::SecretKey(b)))
     }
 
@@ -160,7 +136,6 @@ impl PySecretKey {
     }
 }
 
-/// Firma parcial FROST.
 #[pyclass(name = "PartialSignature")]
 #[derive(Clone)]
 pub struct PyPartialSignature(pub boxkey_core::PartialSignature);
@@ -168,16 +143,22 @@ pub struct PyPartialSignature(pub boxkey_core::PartialSignature);
 #[pymethods]
 impl PyPartialSignature {
     fn to_bytes(&self) -> Vec<u8> {
-        self.0 .0.clone()
+        self.0 .0.to_vec()
+    }
+
+    fn identifier(&self) -> u32 {
+        self.0.identifier()
     }
 
     #[staticmethod]
     fn from_bytes(bytes: Vec<u8>) -> Self {
-        Self(boxkey_core::PartialSignature(bytes))
+        let mut arr = [0u8; 36];
+        let n = bytes.len().min(36);
+        arr[..n].copy_from_slice(&bytes[..n]);
+        Self(boxkey_core::PartialSignature(arr))
     }
 }
 
-/// Firma Schnorr BIP340 agregada (64 bytes).
 #[pyclass(name = "SchnorrSignature")]
 #[derive(Clone)]
 pub struct PySchnorrSignature(pub boxkey_core::SchnorrSignature);
@@ -197,11 +178,80 @@ impl PySchnorrSignature {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Clase principal conforme a contratos.md §2.
-// ---------------------------------------------------------------------------
+#[pyclass(name = "NonceHandle")]
+pub struct PyNonceHandle {
+    inner: std::cell::RefCell<boxkey_core::NonceHandle>,
+}
 
-/// Capa conforme: envuelve `BoxKeyCoreImpl` (métodos 1:1 del trait).
+#[pymethods]
+impl PyNonceHandle {
+    fn identifier(&self) -> u32 {
+        self.inner.borrow().identifier()
+    }
+
+    fn is_consumed(&self) -> bool {
+        self.inner.borrow().is_consumed()
+    }
+
+    fn __repr__(&self) -> String {
+        let h = self.inner.borrow();
+        format!("NonceHandle(id={}, consumed={})", h.identifier(), h.is_consumed())
+    }
+}
+
+#[pyclass(name = "SigningSession")]
+#[derive(Clone)]
+pub struct PySigningSession(pub boxkey_core::SigningSession);
+
+#[pymethods]
+impl PySigningSession {
+    #[staticmethod]
+    fn new(
+        message_hash: Vec<u8>,
+        group_public_key: &PyPublicKey,
+        threshold: u8,
+        commitments: Vec<PyCommitment>,
+        verifying_share_points: Vec<(u32, Vec<u8>)>,
+    ) -> PyResult<Self> {
+        let hash = hash32(message_hash)?;
+        let comms: Vec<boxkey_core::Commitment> = commitments.into_iter().map(|c| c.0).collect();
+        let mut vsp = Vec::with_capacity(verifying_share_points.len());
+        for (id, pt) in verifying_share_points {
+            let arr = arr33(pt)?;
+            vsp.push((id, arr));
+        }
+        let session = boxkey_core::SigningSession::new(hash, group_public_key.0, threshold, comms, vsp)
+            .map_err(to_pyerr)?;
+        Ok(Self(session))
+    }
+
+    fn __repr__(&self) -> String {
+        format!("SigningSession({} signers, threshold={})", self.0.signer_count(), self.0.threshold)
+    }
+}
+
+#[pyclass(name = "SignerInfo")]
+#[derive(Clone)]
+pub struct PySignerInfo(pub boxkey_core::SignerInfo);
+
+#[pymethods]
+impl PySignerInfo {
+    #[getter]
+    fn identifier(&self) -> u32 {
+        self.0.identifier
+    }
+
+    #[getter]
+    fn nonce_commitment(&self) -> PyCommitment {
+        PyCommitment(self.0.nonce_commitment.clone())
+    }
+
+    #[getter]
+    fn verifying_share_point(&self) -> Vec<u8> {
+        self.0.verifying_share_point.to_vec()
+    }
+}
+
 #[pyclass(name = "BoxKey")]
 pub struct PyBoxKey;
 
@@ -276,20 +326,22 @@ impl PyBoxKey {
     }
 
     #[staticmethod]
-    fn generate_nonces(share: &PyShare) -> (Vec<u8>, Vec<u8>) {
+    fn generate_nonces(share: &PyShare) -> (PyNonceHandle, PyCommitment) {
         let (h, c) = <BoxKeyCoreImpl as BoxKeyCore>::generate_nonces(&share.0);
-        (h, c.0)
+        let handle = PyNonceHandle {
+            inner: std::cell::RefCell::new(h),
+        };
+        (handle, PyCommitment(c))
     }
 
     #[staticmethod]
     fn sign_partial(
         share: &PyShare,
-        message_hash: Vec<u8>,
-        commitments: Vec<PyCommitment>,
+        session: &PySigningSession,
+        handle: &PyNonceHandle,
     ) -> PyResult<PyPartialSignature> {
-        let hash = hash32(message_hash)?;
-        let c: Vec<boxkey_core::Commitment> = commitments.into_iter().map(|x| x.0).collect();
-        <BoxKeyCoreImpl as BoxKeyCore>::sign_partial(&share.0, &hash, &c)
+        let mut inner = handle.inner.borrow_mut();
+        <BoxKeyCoreImpl as BoxKeyCore>::sign_partial(&share.0, &session.0, &mut *inner)
             .map(PyPartialSignature)
             .map_err(to_pyerr)
     }
@@ -297,12 +349,10 @@ impl PyBoxKey {
     #[staticmethod]
     fn aggregate_signatures(
         sigs: Vec<PyPartialSignature>,
-        pubkey: &PyPublicKey,
-        message_hash: Vec<u8>,
+        session: &PySigningSession,
     ) -> PyResult<PySchnorrSignature> {
-        let hash = hash32(message_hash)?;
         let s: Vec<boxkey_core::PartialSignature> = sigs.into_iter().map(|x| x.0).collect();
-        <BoxKeyCoreImpl as BoxKeyCore>::aggregate_signatures(&s, &pubkey.0, &hash)
+        <BoxKeyCoreImpl as BoxKeyCore>::aggregate_signatures(&s, &session.0)
             .map(PySchnorrSignature)
             .map_err(to_pyerr)
     }
@@ -339,11 +389,6 @@ impl PyBoxKey {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Funciones de módulo.
-// ---------------------------------------------------------------------------
-
-/// Resultado de un DKG completo: shares por participante y sus claves.
 #[pyclass(name = "DkgResult")]
 pub struct PyDkgResult {
     shares: Vec<PyShare>,
@@ -363,7 +408,6 @@ impl PyDkgResult {
     }
 }
 
-/// Ejecuta un DKG (n participantes, umbral t) y devuelve shares y claves.
 #[pyfunction]
 fn run_dkg(n: u8, t: u8) -> PyDkgResult {
     let (shares, keys) = boxkey_core::dkg::run_dkg(n, t);
@@ -376,14 +420,12 @@ fn run_dkg(n: u8, t: u8) -> PyDkgResult {
     }
 }
 
-/// Genera un par de claves (secreta, pública) de participante.
 #[pyfunction]
 fn generate_participant_key() -> (PySecretKey, PyPublicKey) {
     let (sk, pk) = boxkey_core::dkg::generate_participant_key();
     (PySecretKey(sk), PyPublicKey(pk))
 }
 
-/// Módulo Python `boxkey`.
 #[pymodule]
 fn boxkey(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBoxKey>()?;
@@ -395,6 +437,9 @@ fn boxkey(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySecretKey>()?;
     m.add_class::<PyPartialSignature>()?;
     m.add_class::<PySchnorrSignature>()?;
+    m.add_class::<PyNonceHandle>()?;
+    m.add_class::<PySigningSession>()?;
+    m.add_class::<PySignerInfo>()?;
     m.add_class::<PyDkgResult>()?;
     m.add_function(wrap_pyfunction!(run_dkg, m)?)?;
     m.add_function(wrap_pyfunction!(generate_participant_key, m)?)?;
