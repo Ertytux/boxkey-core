@@ -6,10 +6,11 @@ use frost_core::round2::SignatureShare;
 use frost_core::Identifier;
 use frost_secp256k1_tr as frost;
 use rand_core::{CryptoRng, RngCore};
+use zeroize::Zeroizing;
 
 use crate::error::Error;
 use crate::secp256k1::{point_mul_base, scalar_from_canonical_or_zero, scalar_to_bytes, Fs};
-use crate::types::{Commitment, PartialSignature, PublicKey, SchnorrSignature, Share};
+use crate::types::{Commitment, NonceHandle, PartialSignature, PublicKey, SchnorrSignature, Share, SigningSession};
 
 fn scalar_to_signing_share(scalar: &Fs) -> frost_core::keys::SigningShare<frost::Secp256K1Sha256TR> {
     let bytes = scalar_to_bytes(scalar);
@@ -34,7 +35,6 @@ fn point_to_verifying_share(
 fn xonly_to_verifying_key(
     xonly: &[u8; 32],
 ) -> Result<frost_core::VerifyingKey<frost::Secp256K1Sha256TR>, Error> {
-    // BIP340 x-only → SEC1 comprimido (prefijo 0x02 = Y par).
     let mut compressed = [0u8; 33];
     compressed[0] = 0x02;
     compressed[1..33].copy_from_slice(xonly);
@@ -91,117 +91,117 @@ fn frost_sig_to_bc(sig: &frost_core::Signature<frost::Secp256K1Sha256TR>) -> Sch
     SchnorrSignature(arr)
 }
 
+/// Genera nonces y su commitment para un firmante.
+///
+/// Devuelve un [`NonceHandle`] (secreto, consumible una vez) y el
+/// [`Commitment`] (público, compartible).
 pub fn generate_nonces(
     share: &Share,
     rng: &mut (impl RngCore + CryptoRng),
-) -> Result<(Vec<u8>, Commitment), Error> {
+) -> Result<(NonceHandle, Commitment), Error> {
     let kp = bc_share_to_key_package(share)?;
     let (nonces, commitments) = frost_core::round1::commit(kp.signing_share(), rng);
     let hidden = nonces.serialize().expect("serialización de nonces");
     let id = share.identifier();
     let comm = frost_comm_to_bc(id, &commitments);
-    Ok((hidden, comm))
+    Ok((NonceHandle::new(id, hidden), comm))
 }
 
+/// Firma parcial: consume el [`NonceHandle`] y produce una [`PartialSignature`] (id||z).
+///
+/// - El `NonceHandle` se consumirá (no reutilizable tras esta llamada).
+/// - La sesión contiene todos los commitments y el context criptográfico.
+/// - El commitment del nonce usado DEBE coincidir con el commitment en la sesión.
 pub fn sign_partial(
     share: &Share,
-    message_hash: &[u8; 32],
-    commitments: &[Commitment],
-    hidden: &[u8],
+    session: &SigningSession,
+    handle: &mut NonceHandle,
 ) -> Result<PartialSignature, Error> {
     let kp = bc_share_to_key_package(share)?;
     let id = share.identifier();
 
+    let hidden: Zeroizing<Vec<u8>> = handle.consume().map(Zeroizing::new).ok_or_else(|| {
+        Error::InvalidSignature("nonce handle ya consumido".into())
+    })?;
+
+    let nonces = frost_core::round1::SigningNonces::deserialize(&hidden)
+        .map_err(|e| Error::InvalidSignature(format!("nonces inválidos: {e}")))?;
+
     let mut comm_map = BTreeMap::new();
-    for comm in commitments {
-        if comm.0.len() < 4 {
-            return Err(Error::InvalidSignature("commitment demasiado corto".into()));
-        }
-        let cid = u32::from_be_bytes(comm.0[..4].try_into().unwrap());
-        let frost_cid = bc_id_to_frost(cid)?;
-        let scomm = bc_commitment_to_frost(comm)?;
+    for signer in &session.signers {
+        let frost_cid = bc_id_to_frost(signer.identifier)?;
+        let scomm = bc_commitment_to_frost(&signer.nonce_commitment)?;
         comm_map.insert(frost_cid, scomm);
     }
 
-    let nonces = frost_core::round1::SigningNonces::deserialize(hidden)
-        .map_err(|e| Error::InvalidSignature(format!("nonces inválidos: {e}")))?;
-
-    let signing_package = frost_core::SigningPackage::new(comm_map, message_hash);
+    let signing_package = frost_core::SigningPackage::new(comm_map, &session.message_hash);
 
     let sig_share = frost_core::round2::sign(&signing_package, &nonces, &kp)
         .map_err(|e| Error::InvalidSignature(format!("firma parcial falló: {e}")))?;
 
-    let y_point = crate::secp256k1::point_to_bytes(&crate::secp256k1::point_mul_base(
-        &scalar_from_canonical_or_zero(&share.value)
-            .map_err(|_| Error::InvalidSecretKey("share inválida".into()))?,
-    ));
+    let z_bytes = sig_share.serialize();
 
-    let own_comm = commitments.iter().find(|c| {
-        c.0.len() >= 4 && u32::from_be_bytes(c.0[..4].try_into().unwrap()) == id
-    }).ok_or_else(|| Error::InvalidSignature("propio commitment no encontrado".into()))?;
-
-    let mut out = Vec::with_capacity(4 + 33 + 33 + 33 + 32);
-    out.extend_from_slice(&id.to_be_bytes());
-    out.extend_from_slice(&own_comm.0[4..37]);   // D (33)
-    out.extend_from_slice(&own_comm.0[37..70]);  // E (33)
-    out.extend_from_slice(&y_point);              // Y (33)
-    out.extend_from_slice(&sig_share.serialize()); // z (32)
+    let mut out = [0u8; 36];
+    out[..4].copy_from_slice(&id.to_be_bytes());
+    out[4..36].copy_from_slice(&z_bytes);
     Ok(PartialSignature(out))
 }
 
+/// Agrega firmas parciales de una sesión en una firma Schnorr BIP340 final.
+///
+/// Todas las firmas deben pertenecer a la misma [`SigningSession`].
+/// Verifica automáticamente que `threshold` esté cubierto.
 pub fn aggregate_signatures(
     sigs: &[PartialSignature],
-    group_public_key: &PublicKey,
-    message_hash: &[u8; 32],
+    session: &SigningSession,
 ) -> Result<SchnorrSignature, Error> {
     if sigs.is_empty() {
         return Err(Error::InvalidSignature("sin firmas parciales".into()));
     }
 
-    let group_vk = xonly_to_verifying_key(&group_public_key.0)?;
-
-    if sigs.iter().any(|s| s.0.len() != 4 + 33 + 33 + 33 + 32) {
-        return Err(Error::InvalidSignature(
-            "firma parcial inválida: debe ser id(4)||D(33)||E(33)||Y(33)||z(32)".into(),
-        ));
-    }
+    let group_vk = xonly_to_verifying_key(&session.group_public_key.0)?;
 
     let mut sig_shares = BTreeMap::new();
     let mut verifying_shares = BTreeMap::new();
     let mut comm_map = BTreeMap::new();
+    let mut seen_ids = Vec::new();
 
-    for s in sigs {
-        let id = u32::from_be_bytes(s.0[..4].try_into().unwrap());
-        let frost_id = bc_id_to_frost(id)?;
+    for signer in &session.signers {
+        let frost_id = bc_id_to_frost(signer.identifier)?;
 
-        // D(33) y E(33)
-        let d_bytes: &[u8; 33] = &s.0[4..37].try_into().expect("D slice");
-        let e_bytes: &[u8; 33] = &s.0[37..70].try_into().expect("E slice");
-
-        let hiding = frost_core::round1::NonceCommitment::deserialize(&d_bytes[..])
-            .map_err(|e| Error::InvalidSignature(format!("D inválido: {e}")))?;
-        let binding = frost_core::round1::NonceCommitment::deserialize(&e_bytes[..])
-            .map_err(|e| Error::InvalidSignature(format!("E inválido: {e}")))?;
-        let scomm = SigningCommitments::new(hiding, binding);
+        let scomm = bc_commitment_to_frost(&signer.nonce_commitment)?;
         comm_map.insert(frost_id, scomm);
 
-        // Y(33)
-        let y_point: &[u8; 33] = &s.0[70..103].try_into().expect("Y slice");
-        let vs = point_to_verifying_share(y_point)?;
+        let vs = point_to_verifying_share(&signer.verifying_share_point)?;
         verifying_shares.insert(frost_id, vs);
+    }
 
-        // z(32)
-        let sig_share = SignatureShare::deserialize(&s.0[103..135])
+    for sig in sigs {
+        let id = sig.identifier();
+        if seen_ids.contains(&id) {
+            return Err(Error::NonceReuse);
+        }
+        seen_ids.push(id);
+
+        let frost_id = bc_id_to_frost(id)?;
+        let sig_share = SignatureShare::deserialize(&sig.z_bytes()[..])
             .map_err(|e| Error::InvalidSignature(format!("sig share inválida: {e}")))?;
         sig_shares.insert(frost_id, sig_share);
     }
 
-    let signing_package = frost_core::SigningPackage::new(comm_map, message_hash);
+    if seen_ids.len() < session.threshold as usize {
+        return Err(Error::ThresholdNotMet {
+            required: session.threshold as usize,
+            received: seen_ids.len(),
+        });
+    }
+
+    let signing_package = frost_core::SigningPackage::new(comm_map, &session.message_hash);
 
     let pubkey_package = frost_core::keys::PublicKeyPackage::new(
         verifying_shares,
         group_vk,
-        Some(sigs.len() as u16),
+        Some(session.signer_count() as u16),
     );
 
     let frost_sig = frost_core::aggregate(&signing_package, &sig_shares, &pubkey_package)
@@ -223,5 +223,17 @@ pub fn verify_schnorr(
         .map_err(|e| Error::invalid_signature(format!("firma inválida: {e}")))?;
     vk.verify_raw(message_hash, &sig_obj)
         .map_err(|e| Error::invalid_signature(format!("verificación falló: {e}")))?;
+    Ok(())
+}
+
+/// Expone bc_commitment_to_frost para fuzzing (no panic en inputs malformados).
+pub fn debug_parse_commitment(comm: &Commitment) -> Result<(), Error> {
+    bc_commitment_to_frost(comm)?;
+    Ok(())
+}
+
+/// Expone xonly_to_verifying_key para fuzzing (no panic en inputs malformados).
+pub fn debug_parse_public_key(xonly: &[u8; 32]) -> Result<(), Error> {
+    xonly_to_verifying_key(xonly)?;
     Ok(())
 }

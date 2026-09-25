@@ -1,5 +1,6 @@
 use boxkey_core::dkg;
 use boxkey_core::frost_adapter;
+use boxkey_core::SigningSession;
 use proptest::prelude::*;
 
 proptest! {
@@ -12,17 +13,24 @@ proptest! {
         let msg = [msg_byte; 32];
 
         let mut rng = rand::rngs::OsRng;
-        let (h, comm) = frost_adapter::generate_nonces(&shares[0], &mut rng).unwrap();
-        let (h2, comm2) = frost_adapter::generate_nonces(&shares[1], &mut rng).unwrap();
+        let (mut h1, c1) = frost_adapter::generate_nonces(&shares[0], &mut rng).unwrap();
+        let (mut h2, c2) = frost_adapter::generate_nonces(&shares[1], &mut rng).unwrap();
 
-        let sig0 = frost_adapter::sign_partial(
-            &shares[0], &msg, &[comm.clone(), comm2.clone()], &h,
-        ).unwrap();
-        let sig1 = frost_adapter::sign_partial(
-            &shares[1], &msg, &[comm, comm2], &h2,
+        let session = SigningSession::new(
+            msg,
+            group_key,
+            2,
+            vec![c1, c2],
+            vec![
+                (shares[0].identifier(), shares[0].full_public_key_point()),
+                (shares[1].identifier(), shares[1].full_public_key_point()),
+            ],
         ).unwrap();
 
-        let agg = frost_adapter::aggregate_signatures(&[sig0, sig1], &group_key, &msg).unwrap();
+        let sig0 = frost_adapter::sign_partial(&shares[0], &session, &mut h1).unwrap();
+        let sig1 = frost_adapter::sign_partial(&shares[1], &session, &mut h2).unwrap();
+
+        let agg = frost_adapter::aggregate_signatures(&[sig0, sig1], &session).unwrap();
         prop_assert!(frost_adapter::verify_schnorr(&agg, &group_key, &msg).is_ok());
     }
 
@@ -37,17 +45,24 @@ proptest! {
         let msg = [msg_byte; 32];
 
         let mut rng = rand::rngs::OsRng;
-        let (h, comm) = frost_adapter::generate_nonces(&shares[0], &mut rng).unwrap();
-        let (h2, comm2) = frost_adapter::generate_nonces(&shares[1], &mut rng).unwrap();
+        let (mut h1, c1) = frost_adapter::generate_nonces(&shares[0], &mut rng).unwrap();
+        let (mut h2, c2) = frost_adapter::generate_nonces(&shares[1], &mut rng).unwrap();
 
-        let sig0 = frost_adapter::sign_partial(
-            &shares[0], &msg, &[comm.clone(), comm2.clone()], &h,
-        ).unwrap();
-        let sig1 = frost_adapter::sign_partial(
-            &shares[1], &msg, &[comm, comm2], &h2,
+        let session = SigningSession::new(
+            msg,
+            group_key,
+            2,
+            vec![c1, c2],
+            vec![
+                (shares[0].identifier(), shares[0].full_public_key_point()),
+                (shares[1].identifier(), shares[1].full_public_key_point()),
+            ],
         ).unwrap();
 
-        let agg = frost_adapter::aggregate_signatures(&[sig0, sig1], &group_key, &msg).unwrap();
+        let sig0 = frost_adapter::sign_partial(&shares[0], &session, &mut h1).unwrap();
+        let sig1 = frost_adapter::sign_partial(&shares[1], &session, &mut h2).unwrap();
+
+        let agg = frost_adapter::aggregate_signatures(&[sig0, sig1], &session).unwrap();
         prop_assert!(frost_adapter::verify_schnorr(&agg, &wrong_group, &msg).is_err(),
             "wrong group key debe fallar");
     }

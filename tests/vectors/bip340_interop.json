@@ -4,7 +4,7 @@
   "k256_verification": true,
   "key_type": "direct_BIP340",
   "message": "abababababababababababababababababababababababababababababababab",
-  "public_key": "a9e93dd727eacbede7006c40324062cc1f6127d657c78954051ae8a4f75e9c64",
-  "signature": "11a2694372be619f0d577cd46cec7c0a4068e687561b0371e25ca1bd44eed10ce67a2c8540cf6fc4e931f4e3aedefc3b6d23e885d8c2db2413c0c424c50dd98f",
+  "public_key": "e7677933cdd4c73691ad6816c479469ada45ce4670f1fce968268bee3454cde0",
+  "signature": "27b9e58b43832bc3d7f7542e10e237b5fabd78e350d71b81a1d92399c3f7ab81a473e92154415882b7c7738d1fb1373d7e9ebe5febefa9854063b8d70a93076f",
   "suite": "secp256k1-bip340-frost-v1"
 }

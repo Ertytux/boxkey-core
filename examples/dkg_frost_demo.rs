@@ -3,7 +3,7 @@ use sha2::Digest;
 use boxkey_core::dkg;
 use boxkey_core::frost_adapter;
 use boxkey_core::reshare;
-use boxkey_core::PublicKey;
+use boxkey_core::{PublicKey, SigningSession};
 
 fn main() {
     println!("=== BoxKey Core (BC) — Demo End-to-End ===");
@@ -39,19 +39,24 @@ fn main() {
     let mut rng = rand::rngs::OsRng;
 
     // Cada firmante genera nonces via frost-core (RFC 9591)
-    let mut hidden = Vec::new();
+    let mut handles = Vec::new();
     let mut commitments = Vec::new();
+    let mut verifying = Vec::new();
     for s in signers {
         let (h, comm) = frost_adapter::generate_nonces(s, &mut rng).unwrap();
-        hidden.push(h);
+        handles.push(h);
         commitments.push(comm);
+        verifying.push((s.identifier(), s.full_public_key_point()));
     }
     println!("    Nonces generados para 2 firmantes");
+
+    let session = SigningSession::new(msg_hash, group_key, 2, commitments, verifying)
+        .expect("sesión válida");
 
     // Cada firmante produce su contribución parcial
     let mut sigs = Vec::new();
     for (i, s) in signers.iter().enumerate() {
-        let sig = frost_adapter::sign_partial(s, &msg_hash, &commitments, &hidden[i]).unwrap();
+        let sig = frost_adapter::sign_partial(s, &session, &mut handles[i]).unwrap();
         sigs.push(sig);
         println!(
             "      Firmante {}: contribución parcial ({} B)",
@@ -62,9 +67,8 @@ fn main() {
     println!("    ✓ 2 contribuciones parciales generadas");
 
     // Agregación via frost-core
-    let agg =
-        frost_adapter::aggregate_signatures(&sigs, &group_key, &msg_hash)
-            .expect("agregación válida");
+    let agg = frost_adapter::aggregate_signatures(&sigs, &session)
+        .expect("agregación válida");
     println!("    Firma Schnorr BIP340: {}", hex::encode(agg.0));
 
     // Verificación final via k256::schnorr (independiente de FROST)
@@ -128,24 +132,27 @@ fn main() {
     // ── Paso 4: Nuevos firmantes firman ─────────────────────────────────
     println!("[4] Nuevos firmantes (2-de-4) firman el mismo mensaje");
     let new_signers: &[boxkey_core::Share] = &new_shares[..2];
-    let mut new_hidden = Vec::new();
+    let mut new_handles = Vec::new();
     let mut new_commitments = Vec::new();
+    let mut new_verifying = Vec::new();
     for s in new_signers {
         let (h, comm) = frost_adapter::generate_nonces(s, &mut rng).unwrap();
-        new_hidden.push(h);
+        new_handles.push(h);
         new_commitments.push(comm);
+        new_verifying.push((s.identifier(), s.full_public_key_point()));
     }
+
+    let new_session = SigningSession::new(msg_hash, group_key, 2, new_commitments, new_verifying)
+        .expect("nueva sesión válida");
 
     let mut new_sigs = Vec::new();
     for (i, s) in new_signers.iter().enumerate() {
-        let sig =
-            frost_adapter::sign_partial(s, &msg_hash, &new_commitments, &new_hidden[i]).unwrap();
+        let sig = frost_adapter::sign_partial(s, &new_session, &mut new_handles[i]).unwrap();
         new_sigs.push(sig);
     }
 
-    let new_agg =
-        frost_adapter::aggregate_signatures(&new_sigs, &group_key, &msg_hash)
-            .expect("nueva agregación válida");
+    let new_agg = frost_adapter::aggregate_signatures(&new_sigs, &new_session)
+        .expect("nueva agregación válida");
     frost_adapter::verify_schnorr(&new_agg, &group_key, &msg_hash)
         .expect("nueva firma final válida");
     println!(

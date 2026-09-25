@@ -1,51 +1,57 @@
-# ADR-0001: FROST propio (RFC 9591) sobre secp256k1
+# ADR-0001: Migración a frost-core (RFC 9591) desde FROST propio
 
-- **Fecha**: 2026-08-19
-- **Estado**: Aceptado
+- **Fecha**: 2026-08-19 (original), 2026-09-04 (actualización P0-C2)
+- **Estado**: Reemplazado
 - **Alcance**: `boxkey-core` (BC)
 
-## Contexto
+## Contexto original
 
 El protocolo BoxKey (BZ) requiere firma distributed threshold (t-de-n) sobre
 `secp256k1` con verificación BIP340. En el mercado existen crates como
-`frost-core`/`frost-secp256k1-tr` (ecosistema Zcash/Redjubjub). La Fase 1.0
-auditó la opción de adoptarlos.
+`frost-core`/`frost-secp256k1-tr` (ecosistema Zcash/Redjubjub).
 
-## Decisión
+## Decisión original (Agosto 2026)
 
-Implementar FROST (RFC 9591) propio sobre la aritmética de `k256`
-(RustCrypto), con verificación cruzada contra el oráculo externo
-`rust-secp256k1` (BIP340). No se migra a `frost-secp256k1-tr`.
+Implementar FROST propio sobre la aritmética de `k256` (RustCrypto), con
+verificación cruzada contra `rust-secp256k1`. La justificación incluía:
+formato propio incompatible con frost-core, DKG propio requerido, y
+disciplina de dependencias.
 
-## Justificación
+## Decisión actual (P0-C2, Septiembre 2026)
 
-1. **Formato y transporte propios**: `frost-core` impone formatos de share y
-   serialización (campos, bit encoding) incompatibles con la especificación BZ
-   (BZ-0010 serialización hex/canonical, BZ-0013 DTOs). Adoptarlo obligaría a
-   capas de conversión que erosionan la trazabilidad con la spec.
-2. **DKG propio requerido**: el protocolo usa Feldman VSS + PoK Schnorr + cifrado
-   ECDH AEAD (share cifrada end-to-end). `frost-secp256k1-tr` trae su propio
-   esquema DKG (RedJubJub) que no soporta el transporte cifrado ni la PoK
-   Schnorr de BZ. Mantener el DKG propio es necesario para la autocustodia
-   absoluta (el coordinador nunca ve secretos).
-3. **Disciplina de dependencias**: BC debe usar solo criptografía estándar y
-   auditada; `frost-*` acopla el proyecto al ecosistema Zcash (Redjubjub,
-   rand_chacha, zkcrypto). `k256` es RustCrypto (implementación de referencia
-   auditada de secp256k1).
-4. **Convención BIP340 integrada**: la normalización even-y se aplica en
-   DKG/reshare/firma como convención nativa del protocolo. Con `frost-*` esa
-   normalización quedaría fuera del control de BC.
+**Migrar a `frost-core` 3.0 + `frost-secp256k1-tr` 3.0** para la capa de
+firma FROST. El DKG (Gennaro/Feldman VSS) y el cifrado ECDH AEAD se
+mantienen propios en `dkg.rs`.
+
+## Justificación del cambio
+
+1. **frost-core 3.0 maduró**: la versión 3.0 corrigió múltiples issues de
+   seguridad y compatibilidad. La API de serialización (`serialize`/`deserialize`)
+   es ahora estable y permite integrar BZ-0010.
+2. **Cobertura de auditoría**: `frost-core` cuenta con auditoría criptográfica
+   independiente (Zcash Foundation). BC no puede replicar ese nivel de
+   escrutinio con un motor propio.
+3. **BIP340 nativo en `frost-secp256k1-tr`**: el ciphersuite
+   `Secp256K1Sha256TR` implementa la normalización even-y BIP340 de forma
+   nativa, eliminando la necesidad de la capa de adaptación manual.
+4. **Mantenimiento reducido**: delegar round1/round2/aggregate a frost-core
+   reduce el código criptográfico en BC a ~220 líneas de adapter.
+5. **El FROST propio se retiene como referencia**: `reference/frost.rs` se
+   conserva como especificación ejecutable, no importada por el production
+   path.
 
 ## Consecuencias
 
-- Mantenimiento del motor criptográfico como responsabilidad propia (mitigado
-  por la verificación cruzada externa que actúa como red de seguridad).
-- El motor propio se conserva y se expone como "API avanzada"; la capa
-  conforme a `contratos.md §2` (trait `BoxKeyCore`) delega en él.
+- El motor propio (`reference/frost.rs`) queda fuera del production path.
+- `frost_adapter.rs` adapta entre los tipos de BC y los tipos de frost-core.
+- Las pruebas de integración verifican que el adapter produce resultados
+  correctos y verificables.
+- El DKG propio y el cifrado ECDH se mantienen sin cambios.
 
 ## Referencias
 
 - RFC 9591 (FROST)
 - BIP340 (Schnorr sobre secp256k1)
 - BZ-0010 (serialización), BZ-0013 (DTOs)
-- `boxkey-protocol/contratos.md §2` (interfaz pública BC)
+- `frost-core` 3.0, `frost-secp256k1-tr` 3.0
+- `reference/frost.rs` (implementación de referencia, no producción)

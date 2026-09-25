@@ -10,7 +10,7 @@
 use core::fmt;
 
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::secp256k1;
 
@@ -93,9 +93,22 @@ impl<'de> Deserialize<'de> for PublicKey {
     }
 }
 
-/// Clave privada escalar (32 bytes).
-#[derive(Clone, PartialEq, Eq, Hash)]
+/// Clave privada escalar (32 bytes). Se zeroiza al dropear.
+#[derive(PartialEq, Eq, Hash)]
 pub struct SecretKey(pub [u8; 32]);
+
+impl Clone for SecretKey {
+    fn clone(&self) -> Self {
+        Self(self.0)
+    }
+}
+
+impl Drop for SecretKey {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.0.zeroize();
+    }
+}
 
 /// Share secreta (fracción de clave) de un participante.
 #[derive(Clone, PartialEq, Eq)]
@@ -144,16 +157,214 @@ pub struct EncryptedShare {
     pub ciphertext: Vec<u8>,
 }
 
-/// Firma parcial FROST.
+/// Firma parcial FROST conforme BZ: `id (u32 BE) || z (32 bytes)` (36 bytes).
 ///
-/// Contenido serializado:
-/// - umbral (u8), nº de firmantes (u32 BE), clave pública del grupo (32),
-/// - por firmante: identificador (u32 BE) || D (33) || E (33) || Y_i (33), y
-/// - `z` del firmante (u32 BE identificador || 32 bytes escalar).
+/// El contexto criptográfico (D, E, verifying shares, group key, threshold)
+/// se mantiene en [`SigningSession`]. Cada PartialSignature transporta
+/// únicamente el identificador del firmante y el escalar z de su contribución.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PartialSignature(pub [u8; 36]);
+
+/// NonceHandle encapsula el secreto de nonce con lifecycle obligatorio:
+/// GENERATED → COMMITTED (commitment publicado) → USED (consumido por sign_partial) → ZEROIZED.
 ///
-/// Se serializa como hex sin prefijo.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
-pub struct PartialSignature(#[serde(with = "serde_hex_vec")] pub Vec<u8>);
+/// Semántica:
+/// - No expone el nonce como `Vec<u8>` en API pública normal.
+/// - Al consumirse via [`NonceHandle::consume`], el secreto se zeroiza y el handle
+///   queda en estado `Consumed`.
+/// - Reutilización detectada: segundo `consume()` retorna `None`.
+/// - `Debug` oculta el secreto.
+/// - No serializable.
+pub struct NonceHandle {
+    identifier: u32,
+    state: NonceState,
+}
+
+enum NonceState {
+    Live { hidden: Zeroizing<Vec<u8>> },
+    Consumed,
+}
+
+impl NonceHandle {
+    /// Crea un nuevo NonceHandle a partir de los nonces secretos serializados
+    /// y el identificador del firmante.
+    pub(crate) fn new(identifier: u32, hidden: Vec<u8>) -> Self {
+        Self {
+            identifier,
+            state: NonceState::Live {
+                hidden: Zeroizing::new(hidden),
+            },
+        }
+    }
+
+    /// Consume el handle, extrayendo los nonces secretos si no ha sido usado antes.
+    /// Tras la extracción, el secreto se zeroiza y el estado pasa a `Consumed`.
+    pub fn consume(&mut self) -> Option<Vec<u8>> {
+        match &mut self.state {
+            NonceState::Live { hidden } => {
+                let result = hidden.clone().to_vec();
+                hidden.zeroize();
+                self.state = NonceState::Consumed;
+                Some(result)
+            }
+            NonceState::Consumed => None,
+        }
+    }
+
+    /// Identificador del firmante asociado a este nonce.
+    pub fn identifier(&self) -> u32 {
+        self.identifier
+    }
+
+    /// `true` si el handle ya ha sido consumido.
+    pub fn is_consumed(&self) -> bool {
+        matches!(self.state, NonceState::Consumed)
+    }
+}
+
+impl fmt::Debug for NonceHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "NonceHandle({{ id: {}, state: {} }})", 
+            self.identifier,
+            match &self.state {
+                NonceState::Live { .. } => "Live",
+                NonceState::Consumed => "Consumed",
+            })
+    }
+}
+
+impl Drop for NonceHandle {
+    fn drop(&mut self) {
+        if let NonceState::Live { hidden } = &mut self.state {
+            hidden.zeroize();
+        }
+    }
+}
+
+/// Información de un firmante dentro de una sesión de firma.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SignerInfo {
+    /// Identificador del firmante (1..=n).
+    pub identifier: u32,
+    /// Compromiso de nonces: `id(4) || D(33) || E(33)`.
+    pub nonce_commitment: Commitment,
+    /// Punto SEC1 comprimido de la clave pública parcial (33 bytes).
+    pub verifying_share_point: [u8; 33],
+}
+
+/// Sesión de firma FROST: contexto que agrupa todos los datos necesarios
+/// para generar firmas parciales y agregarlas.
+///
+/// Equivale conceptualmente a `SigningPackage` + contexto adicional
+/// (verifying shares, group key, threshold).
+#[derive(Clone, PartialEq, Eq)]
+pub struct SigningSession {
+    /// Hash del mensaje a firmar (32 bytes).
+    pub message_hash: [u8; 32],
+    /// Clave pública del grupo (x-only BIP340).
+    pub group_public_key: PublicKey,
+    /// Umbral (t).
+    pub threshold: u8,
+    /// Firmantes de la sesión, ordenados por identificador ascendente.
+    pub signers: Vec<SignerInfo>,
+}
+
+impl SigningSession {
+    /// Construye una sesión validando la consistencia de los datos.
+    ///
+    /// - `signers` debe contener al menos `threshold` firmantes.
+    /// - Los identificadores deben ser únicos y > 0.
+    /// - Los commitments deben tener formato `id(4) || D(33) || E(33)`.
+    pub fn new(
+        message_hash: [u8; 32],
+        group_public_key: PublicKey,
+        threshold: u8,
+        commitments: Vec<Commitment>,
+        verifying_share_points: Vec<(u32, [u8; 33])>,
+    ) -> Result<Self, crate::error::Error> {
+        let t = threshold as usize;
+        if commitments.len() < t {
+            return Err(crate::error::Error::InvalidSignature(
+                format!("commitments insuficientes: {} < {t}", commitments.len())
+            ));
+        }
+        if commitments.len() != verifying_share_points.len() {
+            return Err(crate::error::Error::InvalidSignature(
+                "commitments y verifying shares longitud distinta".into()
+            ));
+        }
+
+        let mut signers = Vec::with_capacity(commitments.len());
+        for comm in &commitments {
+            if comm.0.len() != 70 {
+                return Err(crate::error::Error::InvalidSignature(
+                    format!("commitment length {} != 70", comm.0.len())
+                ));
+            }
+            let id = u32::from_be_bytes(comm.0[..4].try_into().map_err(|_| {
+                crate::error::Error::InvalidSignature("id en commitment".into())
+            })?);
+            if id == 0 {
+                return Err(crate::error::Error::InvalidSignature(
+                    "identificador 0 inválido".into()
+                ));
+            }
+            if comm.0[..4] != id.to_be_bytes() {
+                return Err(crate::error::Error::InvalidSignature(
+                    "id incoherente dentro del commitment".into(),
+                ));
+            }
+            let y_point = verifying_share_points
+                .iter()
+                .find(|(pid, _)| *pid == id)
+                .map(|(_, pt)| *pt)
+                .ok_or_else(|| crate::error::Error::InvalidSignature(
+                    format!("sin verifying share para firmante {id}")
+                ))?;
+            if y_point[0] != 0x02 && y_point[0] != 0x03 {
+                return Err(crate::error::Error::InvalidSignature(
+                    "verifying share point malformado".into()
+                ));
+            }
+            signers.push(SignerInfo {
+                identifier: id,
+                nonce_commitment: comm.clone(),
+                verifying_share_point: y_point,
+            });
+        }
+        signers.sort_by_key(|s| s.identifier);
+
+        Ok(Self {
+            message_hash,
+            group_public_key,
+            threshold,
+            signers,
+        })
+    }
+
+    /// Commitment de todos los firmantes, en orden de identificador.
+    pub fn commitments(&self) -> Vec<Commitment> {
+        self.signers.iter().map(|s| s.nonce_commitment.clone()).collect()
+    }
+
+    /// Verifying shares points de todos los firmantes, en orden de identificador.
+    pub fn verifying_shares(&self) -> Vec<(u32, [u8; 33])> {
+        self.signers.iter().map(|s| (s.identifier, s.verifying_share_point)).collect()
+    }
+
+    /// Número de firmantes en la sesión.
+    pub fn signer_count(&self) -> usize {
+        self.signers.len()
+    }
+}
+
+impl fmt::Debug for SigningSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SigningSession {{ {} firmantes, msg: {}... }}",
+            self.signers.len(),
+            hex::encode(&self.message_hash[..4]))
+    }
+}
 
 /// Firma Schnorr BIP340 agregada `(R.x || s)` (64 bytes).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -303,9 +514,43 @@ impl EncryptedShare {
 }
 
 impl PartialSignature {
-    /// Bytes de la firma parcial.
-    pub fn as_bytes(&self) -> &[u8] {
+    /// Bytes `id(4) || z(32)` de la firma parcial.
+    pub fn as_bytes(&self) -> &[u8; 36] {
         &self.0
+    }
+
+    /// Identificador del firmante.
+    pub fn identifier(&self) -> u32 {
+        u32::from_be_bytes(self.0[..4].try_into().unwrap())
+    }
+
+    /// Escalar `z` de la contribución (32 bytes).
+    pub fn z_bytes(&self) -> [u8; 32] {
+        self.0[4..36].try_into().unwrap()
+    }
+}
+
+impl Serialize for PartialSignature {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serde_hex_array::serialize(&self.0, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PartialSignature {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(PartialSignature(serde_hex_array::deserialize(deserializer)?))
+    }
+}
+
+impl fmt::Debug for PartialSignature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PartialSignature(id={})", self.identifier())
     }
 }
 

@@ -5,8 +5,8 @@ use crate::error::Error;
 use crate::frost_adapter;
 use crate::reshare;
 use crate::types::{
-    Commitment, EncryptedShare, PartialSignature, PublicKey, SchnorrSignature, SecretKey,
-    SecretShare, Share,
+    Commitment, EncryptedShare, NonceHandle, PartialSignature, PublicKey, SchnorrSignature,
+    SecretKey, SecretShare, Share, SigningSession,
 };
 
 pub trait BoxKeyCore {
@@ -37,18 +37,17 @@ pub trait BoxKeyCore {
 
     fn derive_partial_public_key(share: &Share) -> PublicKey;
 
-    fn generate_nonces(share: &Share) -> (Vec<u8>, Commitment);
+    fn generate_nonces(share: &Share) -> (NonceHandle, Commitment);
 
     fn sign_partial(
         share: &Share,
-        message_hash: &[u8; 32],
-        commitments: &[Commitment],
+        session: &SigningSession,
+        handle: &mut NonceHandle,
     ) -> Result<PartialSignature, Error>;
 
     fn aggregate_signatures(
         sigs: &[PartialSignature],
-        pubkey: &PublicKey,
-        message_hash: &[u8; 32],
+        session: &SigningSession,
     ) -> Result<SchnorrSignature, Error>;
 
     fn verify_schnorr(sig: &SchnorrSignature, pubkey: &PublicKey, message_hash: &[u8; 32]) -> bool;
@@ -110,38 +109,30 @@ impl BoxKeyCore for BoxKeyCoreImpl {
         dkg::derive_partial_public_key(share)
     }
 
-    fn generate_nonces(share: &Share) -> (Vec<u8>, Commitment) {
+    fn generate_nonces(share: &Share) -> (NonceHandle, Commitment) {
         let mut rng = OsRng;
         match frost_adapter::generate_nonces(share, &mut rng) {
             Ok((hidden, commitment)) => (hidden, commitment),
-            Err(_) => (Vec::new(), Commitment(Vec::new())),
+            Err(_) => {
+                let empty_handle = NonceHandle::new(share.identifier(), Vec::new());
+                (empty_handle, Commitment(Vec::new()))
+            }
         }
     }
 
     fn sign_partial(
         share: &Share,
-        message_hash: &[u8; 32],
-        commitments: &[Commitment],
+        session: &SigningSession,
+        handle: &mut NonceHandle,
     ) -> Result<PartialSignature, Error> {
-        let mut rng = OsRng;
-        let (hidden, own_comm) = frost_adapter::generate_nonces(share, &mut rng)?;
-
-        let mut adjusted = commitments.to_vec();
-        if let Some(pos) = adjusted.iter().position(|c| {
-            c.0.len() >= 4 && u32::from_be_bytes(c.0[..4].try_into().unwrap()) == share.identifier()
-        }) {
-            adjusted[pos] = own_comm;
-        }
-
-        frost_adapter::sign_partial(share, message_hash, &adjusted, &hidden)
+        frost_adapter::sign_partial(share, session, handle)
     }
 
     fn aggregate_signatures(
         sigs: &[PartialSignature],
-        pubkey: &PublicKey,
-        message_hash: &[u8; 32],
+        session: &SigningSession,
     ) -> Result<SchnorrSignature, Error> {
-        frost_adapter::aggregate_signatures(sigs, pubkey, message_hash)
+        frost_adapter::aggregate_signatures(sigs, session)
     }
 
     fn verify_schnorr(sig: &SchnorrSignature, pubkey: &PublicKey, message_hash: &[u8; 32]) -> bool {
@@ -171,8 +162,6 @@ impl BoxKeyCore for BoxKeyCoreImpl {
         dkg::verify_and_decrypt_share(encrypted, my_new_key)
     }
 }
-
-const DEFAULT_NONCE_MSG: [u8; 32] = [0u8; 32];
 
 #[cfg(test)]
 mod tests {
@@ -243,44 +232,106 @@ mod tests {
         let group = signer.group_public_key();
         let msg = [0x42u8; 32];
 
-        let (hidden, comm) = <BoxKeyCoreImpl as BoxKeyCore>::generate_nonces(signer);
+        let (mut handle, comm) = <BoxKeyCoreImpl as BoxKeyCore>::generate_nonces(signer);
         assert!(comm.0.len() >= 70);
+
+        let verifying_pk = signer.full_public_key_point();
+        let session = SigningSession::new(
+            msg,
+            group,
+            1,
+            vec![comm],
+            vec![(signer.identifier(), verifying_pk)],
+        ).expect("sesión válida");
 
         let sig = <BoxKeyCoreImpl as BoxKeyCore>::sign_partial(
             signer,
-            &msg,
-            std::slice::from_ref(&comm),
+            &session,
+            &mut handle,
         )
         .expect("firma parcial 1-de-1");
+        assert!(handle.is_consumed(), "handle consumido tras firma");
 
         let agg = <BoxKeyCoreImpl as BoxKeyCore>::aggregate_signatures(
             &[sig],
-            &group,
-            &msg,
+            &session,
         )
         .expect("agrega");
         assert!(
             <BoxKeyCoreImpl as BoxKeyCore>::verify_schnorr(&agg, &group, &msg),
             "firma final verifica"
         );
-        let _ = hidden;
+    }
 
-        let sig = <BoxKeyCoreImpl as BoxKeyCore>::sign_partial(
-            signer,
-            &msg,
-            std::slice::from_ref(&comm),
-        )
-        .expect("firma parcial 1-de-1");
+    #[test]
+    fn nonce_reuse_rejected_via_trait() {
+        let (shares, _) = dkg::run_dkg(2, 2);
+        let group = shares[0].group_public_key();
+        let msg = [0x42u8; 32];
 
-        let agg = <BoxKeyCoreImpl as BoxKeyCore>::aggregate_signatures(
-            &[sig],
-            &group,
-            &msg,
-        )
-        .expect("agrega");
+        let (mut h1, c1) = <BoxKeyCoreImpl as BoxKeyCore>::generate_nonces(&shares[0]);
+        let (mut h2, c2) = <BoxKeyCoreImpl as BoxKeyCore>::generate_nonces(&shares[1]);
+
+        let vk1 = shares[0].full_public_key_point();
+        let vk2 = shares[1].full_public_key_point();
+        let session = SigningSession::new(
+            msg,
+            group,
+            2,
+            vec![c1, c2],
+            vec![(shares[0].identifier(), vk1), (shares[1].identifier(), vk2)],
+        ).expect("sesión válida");
+
+        let _s1 = <BoxKeyCoreImpl as BoxKeyCore>::sign_partial(&shares[0], &session, &mut h1)
+            .expect("primera firma ok");
+        assert!(h1.is_consumed());
+
+        // Reusing consumed handle should fail
+        let result = <BoxKeyCoreImpl as BoxKeyCore>::sign_partial(&shares[0], &session, &mut h1);
+        assert!(result.is_err(), "handle consumido debe rechazar segunda firma");
+
+        let _s2 = <BoxKeyCoreImpl as BoxKeyCore>::sign_partial(&shares[1], &session, &mut h2)
+            .expect("segunda firma ok");
+    }
+
+    #[test]
+    fn two_of_three_via_trait() {
+        let (shares, _) = dkg::run_dkg(3, 2);
+        let group = shares[0].group_public_key();
+        let msg = [0x42u8; 32];
+        let signers = &shares[..2];
+
+        let mut handles = Vec::new();
+        let mut commitments = Vec::new();
+        let mut verifying = Vec::new();
+        for s in signers {
+            let (h, c) = <BoxKeyCoreImpl as BoxKeyCore>::generate_nonces(s);
+            handles.push(h);
+            commitments.push(c);
+            verifying.push((s.identifier(), s.full_public_key_point()));
+        }
+
+        let session = SigningSession::new(
+            msg,
+            group,
+            2,
+            commitments,
+            verifying,
+        ).expect("sesión 2-de-3");
+
+        let mut sigs = Vec::new();
+        for (i, s) in signers.iter().enumerate() {
+            let sig = <BoxKeyCoreImpl as BoxKeyCore>::sign_partial(
+                s, &session, &mut handles[i],
+            ).expect("firma parcial");
+            sigs.push(sig);
+        }
+
+        let agg = <BoxKeyCoreImpl as BoxKeyCore>::aggregate_signatures(&sigs, &session)
+            .expect("agrega 2-de-3");
         assert!(
             <BoxKeyCoreImpl as BoxKeyCore>::verify_schnorr(&agg, &group, &msg),
-            "firma final verifica"
+            "firma 2-de-3 verifica"
         );
     }
 

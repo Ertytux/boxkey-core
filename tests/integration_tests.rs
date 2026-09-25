@@ -1,5 +1,5 @@
 use boxkey_core::dkg;
-use boxkey_core::{BoxKeyCore, BoxKeyCoreImpl};
+use boxkey_core::{BoxKeyCore, BoxKeyCoreImpl, SigningSession};
 
 #[test]
 fn flujo_completo_via_trait() {
@@ -48,7 +48,7 @@ fn flujo_completo_via_trait() {
     let group = dkg::derive_public_key(&shares).expect("clave de grupo");
     assert_eq!(group, shares[0].group_public_key());
 
-    let (_hidden, comm) = <BoxKeyCoreImpl as BoxKeyCore>::generate_nonces(&shares[0]);
+    let (_handle, comm) = <BoxKeyCoreImpl as BoxKeyCore>::generate_nonces(&shares[0]);
     assert!(comm.0.len() >= 70);
 }
 
@@ -59,9 +59,14 @@ fn envelope_versionado_se_serializa_y_valida() {
     let (sk, pk) = dkg::generate_participant_key();
     let msg = [0x42u8; 32];
 
-    let (_hidden, comm) = <BoxKeyCoreImpl as BoxKeyCore>::generate_nonces(signer);
+    let (mut handle, comm) = <BoxKeyCoreImpl as BoxKeyCore>::generate_nonces(signer);
+    let group = signer.group_public_key();
+    let verifying_pk = signer.full_public_key_point();
+    let session = SigningSession::new(msg, group, 1, vec![comm], vec![(signer.identifier(), verifying_pk)])
+        .expect("sesión");
+
     let sig =
-        <BoxKeyCoreImpl as BoxKeyCore>::sign_partial(signer, &msg, std::slice::from_ref(&comm))
+        <BoxKeyCoreImpl as BoxKeyCore>::sign_partial(signer, &session, &mut handle)
             .expect("firma parcial");
 
     let envelope = boxkey_core::Envelope::new(boxkey_core::MessageKind::PartialSignature {

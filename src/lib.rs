@@ -22,6 +22,6 @@ pub use reshare::{
 };
 pub use serialize::{canonical_json, validate_versioning, Envelope, MessageKind, MessageType};
 pub use types::{
-    Commitment, EncryptedShare, PartialSignature, PublicKey, SchnorrSignature, SecretKey,
-    SecretShare, Share,
+    Commitment, EncryptedShare, NonceHandle, PartialSignature, PublicKey, SchnorrSignature,
+    SecretKey, SecretShare, Share, SignerInfo, SigningSession,
 };
